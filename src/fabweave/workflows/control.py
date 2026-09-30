@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Any
 
 from fabweave.chamber.matching import Tolerance, mismatch_reasons
 from fabweave.chemicals.shelf_life import shelf_life_remaining
@@ -8,6 +9,7 @@ from fabweave.cleanroom.excursion import active_excursion
 from fabweave.contamination.segregation import incompatible_pairs
 from fabweave.core.decision import Decision, allow, deny
 from fabweave.core.events import EventLog
+from fabweave.core.ids import deterministic_id
 from fabweave.core.timebox import TimeBox
 from fabweave.dedication.tool import DedicationPolicy, policy_decision
 from fabweave.dispatch.priority import DispatchCandidate, rank_candidates
@@ -15,11 +17,12 @@ from fabweave.energy.demand import demand_violations
 from fabweave.genealogy.carrier import GenealogyGraph
 from fabweave.holds.release import HoldState, release_decision
 from fabweave.lot.merge import Lot, merge_lots
+from fabweave.lot.split import MachineCapacity, SplitResult, Sublot, plan_capacity_allocations, split_lot
 from fabweave.maintenance.window import MaintenancePolicy, assignment_decision
 from fabweave.metrology.sampling import Wafer, deterministic_sample
 from fabweave.queue_time.enforcer import QueueLimit, queue_time_decision
 from fabweave.recipe.qualification import Qualification, qualification_decision
-from fabweave.reticle.reservation import Reservation, ReservationBook
+from fabweave.reticle.reservation import Reservation, ReservationBook, can_reserve
 from fabweave.rework.authorization import ReworkPolicy, authorization_decision
 from fabweave.shipment.commit import Allocation, CommitLedger
 from fabweave.spc.control import western_electric_rules
@@ -260,3 +263,279 @@ def performance_summary(
     expected_steps: list[str],
 ) -> PerformanceSummary:
     return PerformanceSummary(takt_result(completions, window_start, window_end), route_yield(steps, expected_steps))
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityOffer:
+    tool_id: str
+    chamber_id: str
+    available: int
+    reticle_id: str
+    window: TimeBox
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.available, int) or isinstance(self.available, bool) or self.available <= 0:
+            raise ValueError("available capacity must be positive")
+        if not self.reticle_id:
+            raise ValueError("reticle is required for an offered machine")
+
+    def capacity(self) -> MachineCapacity:
+        return MachineCapacity(self.tool_id, self.chamber_id, self.available)
+
+
+def _offer_eligibility(
+    offer: CapacityOffer,
+    lot: Lot,
+    at: int,
+    dedication_policies: list[DedicationPolicy],
+    qualifications: list[Qualification],
+) -> Decision:
+    dedication = policy_decision(lot.product, offer.tool_id, at, dedication_policies)
+    qualification = qualification_decision(
+        offer.tool_id, offer.chamber_id, lot.recipe_revision, offer.window.start, qualifications
+    )
+    return _combine(
+        [dedication, qualification],
+        tool_id=offer.tool_id,
+        chamber_id=offer.chamber_id,
+        reticle_id=offer.reticle_id,
+    )
+
+
+def _job_id(request_id: str, tool_id: str, chamber_id: str) -> str:
+    return deterministic_id("JOB", request_id, tool_id, chamber_id)
+
+
+def _split_payload(request_id: str, result: SplitResult, offers: tuple[CapacityOffer, ...], minimum_quantity: int) -> dict[str, Any]:
+    offer_by_machine = {(offer.tool_id, offer.chamber_id): offer for offer in offers}
+    return {
+        "request_id": request_id,
+        "lot_id": result.parent_id,
+        "product": result.sublots[0].product,
+        "route": result.sublots[0].route,
+        "step": result.sublots[0].step,
+        "recipe_revision": result.sublots[0].recipe_revision,
+        "remaining_quantity": result.remaining_quantity,
+        "minimum_quantity": minimum_quantity,
+        "sublots": [
+            {
+                "lot_id": sublot.lot_id,
+                "parent_id": sublot.parent_id,
+                "product": sublot.product,
+                "route": sublot.route,
+                "step": sublot.step,
+                "recipe_revision": sublot.recipe_revision,
+                "quantity": sublot.quantity,
+                "tool_id": sublot.tool_id,
+                "chamber_id": sublot.chamber_id,
+                "sequence": sublot.sequence,
+                "reticle_id": offer_by_machine[(sublot.tool_id, sublot.chamber_id)].reticle_id,
+                "window_start": offer_by_machine[(sublot.tool_id, sublot.chamber_id)].window.start,
+                "window_end": offer_by_machine[(sublot.tool_id, sublot.chamber_id)].window.end,
+            }
+            for sublot in result.sublots
+        ],
+    }
+
+
+def split_for_idle_capacity(
+    log: EventLog,
+    book: ReservationBook,
+    request_id: str,
+    lot: Lot,
+    offers: list[CapacityOffer],
+    minimum_quantity: int,
+    at: int,
+    dedication_policies: list[DedicationPolicy],
+    qualifications: list[Qualification],
+) -> Decision:
+    """Split a WIP lot across qualified parallel machines with idle capacity.
+
+    Fail-closed: the lot hold, the reticle reservation and the tool/chamber
+    matching gates are all evaluated first, and nothing (no reservation and no
+    event) is committed until every sublot is legal. Numbers, ids and
+    parent/child links are deterministic, so the same request id can be
+    replayed and binds the exact same outcome.
+    """
+
+    stream = f"lot-split:{request_id}"
+    stored = log.read(stream)
+    if stored:
+        return _replay_split_decision(log, book, request_id, lot, offers, minimum_quantity, stored)
+
+    if lot.recipe_revision <= 0:
+        raise ValueError("invalid recipe revision")
+    if not isinstance(minimum_quantity, int) or isinstance(minimum_quantity, bool) or minimum_quantity <= 0:
+        raise ValueError("minimum sublot quantity must be positive")
+
+    if lot.active_holds:
+        return deny("held_lot_cannot_split", request_id=request_id, lot_id=lot.lot_id)
+
+    ordered = sorted(offers, key=lambda offer: (offer.tool_id, offer.chamber_id))
+    if len({(offer.tool_id, offer.chamber_id) for offer in ordered}) != len(ordered):
+        raise ValueError("the same machine cannot offer capacity twice")
+
+    reasons: list[str] = []
+    eligible: list[CapacityOffer] = []
+    for offer in ordered:
+        decision = _offer_eligibility(offer, lot, at, dedication_policies, qualifications)
+        if not decision.allowed:
+            reasons.extend(f"{reason}@{offer.tool_id}:{offer.chamber_id}" for reason in decision.reasons)
+        else:
+            eligible.append(offer)
+    if reasons:
+        return deny(*sorted(set(reasons)), request_id=request_id, lot_id=lot.lot_id)
+
+    capacities = [offer.capacity() for offer in eligible]
+    allocations = plan_capacity_allocations(lot.quantity, capacities, minimum_quantity)
+    if not allocations:
+        return deny(
+            "no_idle_capacity_meets_minimum_sublot",
+            request_id=request_id,
+            lot_id=lot.lot_id,
+            minimum_quantity=minimum_quantity,
+        )
+    result = split_lot(request_id, lot, capacities, minimum_quantity, allocations)
+
+    conflict_reasons: list[str] = []
+    intra_request: dict[str, list[tuple[int, int]]] = {}
+    for sublot in result.sublots:
+        offer = next(item for item in eligible if (item.tool_id, item.chamber_id) == (sublot.tool_id, sublot.chamber_id))
+        occupied = [
+            *(
+                (reservation.window.start, reservation.window.end)
+                for reservation in book.reservations(offer.reticle_id)
+            ),
+            *intra_request.get(offer.reticle_id, ()),
+        ]
+        if not can_reserve(offer.window.start, offer.window.end, occupied):
+            conflict_reasons.append(f"reticle_busy:{offer.reticle_id}@{offer.tool_id}:{offer.chamber_id}")
+        else:
+            intra_request.setdefault(offer.reticle_id, []).append((offer.window.start, offer.window.end))
+    if conflict_reasons:
+        return deny(*sorted(set(conflict_reasons)), request_id=request_id, lot_id=lot.lot_id)
+
+    offer_by_machine = {
+        (offer.tool_id, offer.chamber_id): offer for offer in eligible
+    }
+    reservations = [
+        Reservation(
+            offer_by_machine[(sublot.tool_id, sublot.chamber_id)].reticle_id,
+            _job_id(request_id, sublot.tool_id, sublot.chamber_id),
+            offer_by_machine[(sublot.tool_id, sublot.chamber_id)].window,
+            lot.recipe_revision,
+        )
+        for sublot in result.sublots
+    ]
+    committed = book.reserve_batch(request_id, reservations)
+
+    payload = _split_payload(request_id, result, tuple(ordered), minimum_quantity)
+    event = log.append(
+        stream,
+        0,
+        deterministic_id("EVT", request_id, lot.lot_id, "lot_split"),
+        at,
+        "lot_split",
+        payload,
+    )
+    return allow(
+        request_id=request_id,
+        lot_id=lot.lot_id,
+        split=result,
+        reservations=committed,
+        remaining_quantity=result.remaining_quantity,
+        event_sequence=event.sequence,
+    )
+
+
+def replay_split(log: EventLog, request_id: str) -> SplitResult:
+    """Rebuild the immutable split result from its append-only event."""
+
+    stored = log.read(f"lot-split:{request_id}")
+    if not stored:
+        raise ValueError("unknown split request")
+    return _result_from_payload(stored[-1].data)
+
+
+def _result_from_payload(payload: dict[str, Any]) -> SplitResult:
+    sublots = tuple(
+        Sublot(
+            lot_id=item["lot_id"],
+            parent_id=item["parent_id"],
+            product=item["product"],
+            route=item["route"],
+            step=item["step"],
+            recipe_revision=item["recipe_revision"],
+            quantity=item["quantity"],
+            tool_id=item["tool_id"],
+            chamber_id=item["chamber_id"],
+            sequence=item["sequence"],
+        )
+        for item in payload["sublots"]
+    )
+    return SplitResult(payload["lot_id"], payload["remaining_quantity"], sublots)
+
+
+def _replay_split_decision(
+    log: EventLog,
+    book: ReservationBook,
+    request_id: str,
+    lot: Lot,
+    offers: list[CapacityOffer],
+    minimum_quantity: int,
+    stored: tuple[Any, ...],
+) -> Decision:
+    event = stored[-1]
+    payload = event.data
+    result = _result_from_payload(payload)
+
+    identity_keys = ("lot_id", "product", "route", "step", "recipe_revision")
+    expected_identity = {
+        "lot_id": lot.lot_id,
+        "product": lot.product,
+        "route": lot.route,
+        "step": lot.step,
+        "recipe_revision": lot.recipe_revision,
+    }
+    if any(payload[key] != expected_identity[key] for key in identity_keys):
+        raise ValueError("request id reused with a different lot")
+    if minimum_quantity != payload["minimum_quantity"]:
+        raise ValueError("request id reused with different minimum quantity")
+    if payload["remaining_quantity"] + sum(item["quantity"] for item in payload["sublots"]) != lot.quantity:
+        raise ValueError("recorded split violates quantity conservation against the lot")
+
+    offer_index = {(offer.tool_id, offer.chamber_id): offer for offer in offers}
+    recorded_keys = {(item["tool_id"], item["chamber_id"]) for item in payload["sublots"]}
+    if recorded_keys - set(offer_index):
+        raise ValueError("request id reused with different machine offers")
+
+    reservations: list[Reservation] = []
+    for item in sorted(payload["sublots"], key=lambda sublot: (sublot["tool_id"], sublot["chamber_id"])):
+        expected_id = deterministic_id("LOT", request_id, lot.lot_id, item["tool_id"], item["chamber_id"])
+        if item["lot_id"] != expected_id:
+            raise ValueError("recorded sublot id is not deterministic for the request")
+        offer = offer_index[(item["tool_id"], item["chamber_id"])]
+        if offer.reticle_id != item["reticle_id"] or (offer.window.start, offer.window.end) != (
+            item["window_start"],
+            item["window_end"],
+        ):
+            raise ValueError("request id reused with different reticle or processing window")
+        reservations.append(
+            Reservation(
+                offer.reticle_id,
+                _job_id(request_id, offer.tool_id, offer.chamber_id),
+                offer.window,
+                lot.recipe_revision,
+            )
+        )
+
+    committed = book.reserve_batch(request_id, reservations)
+    return allow(
+        request_id=request_id,
+        lot_id=lot.lot_id,
+        split=result,
+        reservations=committed,
+        remaining_quantity=result.remaining_quantity,
+        event_sequence=event.sequence,
+        replay=True,
+    )
