@@ -50,3 +50,6 @@ class ReservationBook:
 
     def reservations(self, reticle_id: str) -> tuple[Reservation, ...]:
         return tuple(item for item in self._reservations if item.reticle_id == reticle_id)
+
+    def held_by(self, request_id: str) -> tuple[Reservation, ...]:
+        return self._requests.get(request_id, ())

@@ -19,6 +19,7 @@ from fabweave.energy.demand import coincident_peak, demand_violations
 from fabweave.genealogy.carrier import GenealogyGraph
 from fabweave.holds.release import HoldState, release_decision
 from fabweave.lot.merge import Lot, merge_lots
+from fabweave.lot.split import MachineCapacity, SplitLedger, plan_split
 from fabweave.maintenance.window import MaintenancePolicy, assignment_decision
 from fabweave.metrology.sampling import Wafer, deterministic_sample
 from fabweave.queue_time.enforcer import QueueLimit, queue_time_decision
@@ -44,6 +45,7 @@ from fabweave.workflows.control import (
     record_containment,
     reserve_qualified,
     rework_release_decision,
+    split_for_idle_capacity,
 )
 
 
@@ -228,6 +230,19 @@ def test_lot_merge_preserves_quantity_and_rejects_held_input():
         merge_lots("REQ-2", [lots[0], Lot("LOT-C", "P", "R", "S", 1, 2, frozenset({"QA"}))])
 
 
+def test_split_plan_sizes_children_by_idle_capacity_and_conserves_quantity():
+    lot = Lot("LOT-P", "P", "R", "S", 2, 20)
+    plan = plan_split("REQ-1", lot, 5, [MachineCapacity("TOOL-B", "CH-1", 7), MachineCapacity("TOOL-A", "CH-1", 8)])
+    assert [(child.tool_id, child.quantity) for child in plan.children] == [("TOOL-A", 8), ("TOOL-B", 7)]
+    assert plan.residual_quantity == 5
+    assert sum(plan.after_quantities.values()) == 20
+    assert plan.parent_of == {child.lot_id: "LOT-P" for child in plan.children}
+    again = plan_split("REQ-1", lot, 5, [MachineCapacity("TOOL-A", "CH-1", 8), MachineCapacity("TOOL-B", "CH-1", 7)])
+    assert again == plan
+    (child,) = plan.wip_lots()[:1]
+    assert (child.product, child.route, child.step, child.recipe_revision, child.quantity) == ("P", "R", "S", 2, 8)
+
+
 def test_dedication_uses_effective_revision_and_deny_overrides_allow():
     policies = [
         DedicationPolicy(1, 0, {"P": frozenset({"T1", "T2"})}),
@@ -344,3 +359,103 @@ def test_dedicated_qualification_combines_both_policy_gates():
 def test_performance_summary_uses_filtered_takt_and_ordered_route_yield():
     summary = performance_summary([0, 10, 20], 5, 20, [StepYield("A", 10, 9), StepYield("B", 9, 8)], ["A", "B"])
     assert summary.takt.takt == 10 and summary.route_yield == pytest.approx(0.8)
+
+
+def test_split_plan_rebalances_residual_and_child_below_minimum():
+    lot = Lot("LOT-P", "P", "R", "S", 2, 20)
+    plan = plan_split("REQ-1", lot, 5, [MachineCapacity("TOOL-A", "CH-1", 8), MachineCapacity("TOOL-B", "CH-1", 8)])
+    assert [child.quantity for child in plan.children] == [8, 7]
+    assert plan.residual_quantity == 5
+    consumed = plan_split("REQ-2", Lot("LOT-P", "P", "R", "S", 2, 9), 5, [MachineCapacity("TOOL-A", "CH-1", 9)])
+    assert [child.quantity for child in consumed.children] == [9] and consumed.residual_quantity == 0
+    with pytest.raises(ValueError):
+        plan_split("REQ-3", Lot("LOT-P", "P", "R", "S", 2, 9), 5, [MachineCapacity("TOOL-A", "CH-1", 8)])
+
+
+def test_split_plan_rejects_held_lot_bad_minimum_and_duplicate_machines():
+    held = Lot("LOT-P", "P", "R", "S", 2, 20, frozenset({"QA"}))
+    with pytest.raises(ValueError):
+        plan_split("REQ-1", held, 5, [MachineCapacity("TOOL-A", "CH-1", 8)])
+    with pytest.raises(ValueError):
+        plan_split("REQ-1", Lot("LOT-P", "P", "R", "S", 2, 20), 0, [MachineCapacity("TOOL-A", "CH-1", 8)])
+    with pytest.raises(ValueError):
+        plan_split("REQ-1", Lot("LOT-P", "P", "R", "S", 2, 20), 5, [MachineCapacity("TOOL-A", "CH-1", 5), MachineCapacity("TOOL-A", "CH-1", 5)])
+
+
+def test_split_ledger_replays_and_rejects_conflicting_reuse():
+    ledger = SplitLedger()
+    plan = plan_split("REQ-1", Lot("LOT-P", "P", "R", "S", 2, 20), 5, [MachineCapacity("TOOL-A", "CH-1", 8)])
+    assert ledger.register(plan) is plan
+    assert ledger.register(plan) is plan
+    conflict = plan_split("REQ-1", Lot("LOT-P", "P", "R", "S", 2, 21), 5, [MachineCapacity("TOOL-A", "CH-1", 8)])
+    with pytest.raises(ValueError):
+        ledger.register(conflict)
+    assert ledger.plan_for("REQ-1") == plan
+    assert [child.parent_id for child in ledger.children_of("LOT-P")] == ["LOT-P"]
+    assert ledger.parent_of() == plan.parent_of
+
+
+def test_split_for_idle_capacity_excludes_unmatched_machines_and_commits_atomically():
+    book, ledger, log = ReservationBook(), SplitLedger(), EventLog()
+    lot = Lot("LOT-P", "P", "R", "S", 2, 20)
+    machines = [MachineCapacity("TOOL-A", "CH-1", 8), MachineCapacity("TOOL-B", "CH-1", 7), MachineCapacity("TOOL-C", "CH-1", 9)]
+    qualifications = [Qualification("TOOL-A", "CH-1", 2, 0, 100), Qualification("TOOL-B", "CH-1", 2, 0, 100)]
+    outcome = split_for_idle_capacity(book, ledger, log, "REQ-1", lot, 5, machines, qualifications, ["RET-1", "RET-2"], TimeBox(10, 20), 50)
+    assert outcome.decision.allowed
+    assert [(child.tool_id, child.quantity) for child in outcome.plan.children] == [("TOOL-A", 8), ("TOOL-B", 7)]
+    assert outcome.plan.residual_quantity == 5
+    assert outcome.decision.evidence["rejected_machines"] == {"TOOL-C/CH-1": ("qualification_missing",)}
+    assert [reservation.reticle_id for reservation in outcome.reservations] == ["RET-1", "RET-2"]
+    assert outcome.event_sequence == 1
+    replay = split_for_idle_capacity(book, ledger, log, "REQ-1", lot, 5, machines, qualifications, ["RET-1", "RET-2"], TimeBox(10, 20), 50)
+    assert (replay.plan, replay.reservations, replay.event_sequence) == (outcome.plan, outcome.reservations, outcome.event_sequence)
+    assert len(log.read("split:REQ-1")) == 1
+    graph = GenealogyGraph({**ledger.parent_of(), "LOT-P": None})
+    assert set(graph.related("LOT-P", "downstream", 1)) == {child.lot_id for child in outcome.plan.children}
+    event = log.read("split:REQ-1")[0]
+    assert event.data["residual_quantity"] == 5 and len(event.data["children"]) == 2
+
+
+def test_split_for_idle_capacity_denies_without_partial_state():
+    book, ledger, log = ReservationBook(), SplitLedger(), EventLog()
+    lot = Lot("LOT-P", "P", "R", "S", 2, 20)
+    machines = [MachineCapacity("TOOL-A", "CH-1", 8)]
+    outcome = split_for_idle_capacity(book, ledger, log, "REQ-1", lot, 5, machines, [], ["RET-1"], TimeBox(10, 20), 50)
+    assert not outcome.decision.allowed and outcome.decision.reasons == ("qualification_missing",)
+    book.reserve_batch("REQ-OTHER", [Reservation("RET-1", "JOB-X", TimeBox(0, 30), 2)])
+    qualified = [Qualification("TOOL-A", "CH-1", 2, 0, 100)]
+    blocked = split_for_idle_capacity(book, ledger, log, "REQ-2", lot, 5, machines, qualified, ["RET-1"], TimeBox(10, 20), 50)
+    assert not blocked.decision.allowed and blocked.decision.reasons == ("reticle_unavailable_in_window",)
+    assert ledger.plan_for("REQ-1") is None and ledger.plan_for("REQ-2") is None
+    assert log.read("split:REQ-1") == () and log.read("split:REQ-2") == ()
+    assert len(book.reservations("RET-1")) == 1
+
+
+def test_split_for_idle_capacity_caps_parallelism_by_available_reticles():
+    book, ledger, log = ReservationBook(), SplitLedger(), EventLog()
+    lot = Lot("LOT-P", "P", "R", "S", 2, 24)
+    machines = [MachineCapacity("TOOL-A", "CH-1", 8), MachineCapacity("TOOL-B", "CH-1", 8), MachineCapacity("TOOL-C", "CH-1", 8)]
+    qualifications = [Qualification(tool, "CH-1", 2, 0, 100) for tool in ("TOOL-A", "TOOL-B", "TOOL-C")]
+    outcome = split_for_idle_capacity(book, ledger, log, "REQ-1", lot, 5, machines, qualifications, ["RET-1"], TimeBox(10, 20), 50)
+    assert outcome.decision.allowed
+    assert [child.tool_id for child in outcome.plan.children] == ["TOOL-A"]
+    assert outcome.plan.residual_quantity == 16
+
+
+def test_split_for_idle_capacity_raises_on_infeasible_quantities_without_partial_state():
+    book, ledger, log = ReservationBook(), SplitLedger(), EventLog()
+    qualified = [Qualification("TOOL-A", "CH-1", 2, 0, 100)]
+    with pytest.raises(ValueError):
+        split_for_idle_capacity(book, ledger, log, "REQ-1", Lot("LOT-P", "P", "R", "S", 2, 9), 5, [MachineCapacity("TOOL-A", "CH-1", 8)], qualified, ["RET-1"], TimeBox(10, 20), 50)
+    assert ledger.plan_for("REQ-1") is None and book.reservations("RET-1") == () and log.read("split:REQ-1") == ()
+
+
+def test_split_for_idle_capacity_conflicting_replay_keeps_original_commit():
+    book, ledger, log = ReservationBook(), SplitLedger(), EventLog()
+    machines = [MachineCapacity("TOOL-A", "CH-1", 8)]
+    qualified = [Qualification("TOOL-A", "CH-1", 2, 0, 100)]
+    first = split_for_idle_capacity(book, ledger, log, "REQ-1", Lot("LOT-P", "P", "R", "S", 2, 20), 5, machines, qualified, ["RET-1"], TimeBox(10, 20), 50)
+    with pytest.raises(ValueError):
+        split_for_idle_capacity(book, ledger, log, "REQ-1", Lot("LOT-P", "P", "R", "S", 2, 21), 5, machines, qualified, ["RET-1"], TimeBox(10, 20), 50)
+    assert ledger.plan_for("REQ-1") == first.plan
+    assert len(book.reservations("RET-1")) == 1 and len(log.read("split:REQ-1")) == 1

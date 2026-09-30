@@ -15,11 +15,12 @@ from fabweave.energy.demand import demand_violations
 from fabweave.genealogy.carrier import GenealogyGraph
 from fabweave.holds.release import HoldState, release_decision
 from fabweave.lot.merge import Lot, merge_lots
+from fabweave.lot.split import MachineCapacity, SplitLedger, SplitPlan, plan_split
 from fabweave.maintenance.window import MaintenancePolicy, assignment_decision
 from fabweave.metrology.sampling import Wafer, deterministic_sample
 from fabweave.queue_time.enforcer import QueueLimit, queue_time_decision
 from fabweave.recipe.qualification import Qualification, qualification_decision
-from fabweave.reticle.reservation import Reservation, ReservationBook
+from fabweave.reticle.reservation import Reservation, ReservationBook, can_reserve
 from fabweave.rework.authorization import ReworkPolicy, authorization_decision
 from fabweave.shipment.commit import Allocation, CommitLedger
 from fabweave.spc.control import western_electric_rules
@@ -230,6 +231,92 @@ def merge_and_commit(request_id: str, lots: list[Lot], ledger: CommitLedger, ord
     merged = merge_lots(request_id, lots)
     allocation = ledger.allocate(request_id, order_id, merged.quantity)
     return merged, allocation
+
+
+@dataclass(frozen=True, slots=True)
+class SplitOutcome:
+    decision: Decision
+    plan: SplitPlan | None
+    reservations: tuple[Reservation, ...]
+    event_sequence: int | None
+
+
+def split_for_idle_capacity(
+    book: ReservationBook,
+    ledger: SplitLedger,
+    log: EventLog,
+    request_id: str,
+    lot: Lot,
+    min_child_quantity: int,
+    machines: list[MachineCapacity],
+    qualifications: list[Qualification],
+    reticle_ids: list[str],
+    window: TimeBox,
+    at: int,
+) -> SplitOutcome:
+    ordered = sorted(machines, key=lambda machine: (machine.tool_id, machine.chamber_id))
+    rejections: dict[str, tuple[str, ...]] = {}
+    qualified: list[MachineCapacity] = []
+    for machine in ordered:
+        decision = qualification_decision(machine.tool_id, machine.chamber_id, lot.recipe_revision, at, qualifications)
+        if decision.allowed:
+            qualified.append(machine)
+        else:
+            rejections[f"{machine.tool_id}/{machine.chamber_id}"] = decision.reasons
+    own = set(book.held_by(request_id))
+    free_reticles = tuple(
+        reticle_id
+        for reticle_id in sorted(set(reticle_ids))
+        if can_reserve(
+            window.start,
+            window.end,
+            [(item.window.start, item.window.end) for item in book.reservations(reticle_id) if item not in own],
+        )
+    )
+    usable = qualified[: len(free_reticles)]
+    evidence = {"rejected_machines": rejections, "free_reticles": free_reticles}
+    if not usable:
+        reasons = [reason for machine_reasons in rejections.values() for reason in machine_reasons]
+        if not ordered:
+            reasons.append("no_parallel_machine_offered")
+        if not free_reticles:
+            reasons.append("reticle_unavailable_in_window")
+        return SplitOutcome(deny(*reasons, **evidence), None, (), None)
+    plan = plan_split(request_id, lot, min_child_quantity, usable)
+    reservations = [Reservation(reticle_id, child.lot_id, window, lot.recipe_revision) for child, reticle_id in zip(plan.children, free_reticles)]
+    committed_reservations = book.reserve_batch(request_id, reservations)
+    committed = ledger.register(plan)
+    event = log.append(
+        f"split:{request_id}",
+        0,
+        request_id,
+        at,
+        "lot_split_committed",
+        {
+            "parent_lot_id": lot.lot_id,
+            "residual_quantity": committed.residual_quantity,
+            "min_child_quantity": min_child_quantity,
+            "window": [window.start, window.end],
+            "children": [
+                {
+                    "lot_id": child.lot_id,
+                    "parent_id": child.parent_id,
+                    "tool_id": child.tool_id,
+                    "chamber_id": child.chamber_id,
+                    "quantity": child.quantity,
+                    "reticle_id": reservation.reticle_id,
+                }
+                for child, reservation in zip(committed.children, committed_reservations)
+            ],
+        },
+    )
+    decision = allow(
+        child_lot_ids=tuple(child.lot_id for child in committed.children),
+        split_quantity=sum(child.quantity for child in committed.children),
+        residual_quantity=committed.residual_quantity,
+        **evidence,
+    )
+    return SplitOutcome(decision, committed, committed_reservations, event.sequence)
 
 
 def dedicated_qualification(
